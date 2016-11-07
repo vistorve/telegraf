@@ -1,11 +1,11 @@
 package models
 
 import (
-	"log"
 	"time"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal/buffer"
+	"github.com/influxdata/telegraf/selfstat"
 )
 
 const (
@@ -21,9 +21,13 @@ type RunningOutput struct {
 	Name              string
 	Output            telegraf.Output
 	Config            *OutputConfig
-	Quiet             bool
 	MetricBufferLimit int
 	MetricBatchSize   int
+
+	MetricsWritten selfstat.Stat
+	BufferSize     selfstat.Stat
+	BufferLimit    selfstat.Stat
+	WriteTime      selfstat.Stat
 
 	metrics     *buffer.Buffer
 	failMetrics *buffer.Buffer
@@ -50,7 +54,12 @@ func NewRunningOutput(
 		Config:            conf,
 		MetricBufferLimit: bufferLimit,
 		MetricBatchSize:   batchSize,
+		MetricsWritten:    selfstat.Register("self_"+name, "metrics_written", map[string]string{}),
+		BufferSize:        selfstat.Register("self_"+name, "buffer_size", map[string]string{}),
+		BufferLimit:       selfstat.Register("self_"+name, "buffer_limit", map[string]string{}),
+		WriteTime:         selfstat.RegisterTiming("self_"+name, "write_time_ns", map[string]string{}),
 	}
+	ro.BufferLimit.Incr(int64(ro.MetricBufferLimit))
 	return ro
 }
 
@@ -84,16 +93,7 @@ func (ro *RunningOutput) AddMetric(metric telegraf.Metric) {
 
 // Write writes all cached points to this output.
 func (ro *RunningOutput) Write() error {
-	if !ro.Quiet {
-		log.Printf("I! Output [%s] buffer fullness: %d / %d metrics. "+
-			"Total gathered metrics: %d. Total dropped metrics: %d.",
-			ro.Name,
-			ro.failMetrics.Len()+ro.metrics.Len(),
-			ro.MetricBufferLimit,
-			ro.metrics.Total(),
-			ro.metrics.Drops()+ro.failMetrics.Drops())
-	}
-
+	ro.BufferSize.Incr(int64(ro.metrics.Len()))
 	var err error
 	if !ro.failMetrics.IsEmpty() {
 		bufLen := ro.failMetrics.Len()
@@ -126,6 +126,7 @@ func (ro *RunningOutput) Write() error {
 	if err == nil {
 		err = ro.write(batch)
 	}
+
 	if err != nil {
 		ro.failMetrics.Add(batch...)
 		return err
@@ -141,10 +142,9 @@ func (ro *RunningOutput) write(metrics []telegraf.Metric) error {
 	err := ro.Output.Write(metrics)
 	elapsed := time.Since(start)
 	if err == nil {
-		if !ro.Quiet {
-			log.Printf("I! Output [%s] wrote batch of %d metrics in %s\n",
-				ro.Name, len(metrics), elapsed)
-		}
+		ro.MetricsWritten.Incr(int64(len(metrics)))
+		ro.BufferSize.Incr(-int64(len(metrics)))
+		ro.WriteTime.Incr(elapsed.Nanoseconds())
 	}
 	return err
 }
